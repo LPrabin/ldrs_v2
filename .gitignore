@@ -5,3 +5,5 @@ __pycache__/
 *.pdf
 *.json
 *.md
+.DS_Store
+.DS_Store tests
