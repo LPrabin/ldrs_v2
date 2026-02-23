@@ -10,7 +10,7 @@ The LLM decides which documents are most likely to contain relevant
 information and returns their names + reasoning. This prevents wasting
 tokens and time searching irrelevant documents.
 
-Uses AsyncOpenAI (same client pattern as existing RAG modules).
+Uses LLMProvider (centralized multi-provider LLM client via LiteLLM).
 """
 
 import json
@@ -18,12 +18,14 @@ import logging
 import os
 import unicodedata
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
-import openai
 from dotenv import load_dotenv
 
 load_dotenv()
+
+if TYPE_CHECKING:
+    from ldrs.llm_provider import LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -119,13 +121,25 @@ class DocSelector:
         # selection.selected_docs -> ["financial_report.pdf"]
     """
 
-    def __init__(self, model: str = "qwen3-vl"):
+    def __init__(
+        self,
+        model: str = "qwen3-vl",
+        llm_provider: Optional["LLMProvider"] = None,
+    ):
         self.model = model
-        self.client = openai.AsyncOpenAI(
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("BASE_URL"),
+
+        if llm_provider is not None:
+            self.llm_provider = llm_provider
+        else:
+            from ldrs.llm_provider import get_provider
+
+            self.llm_provider = get_provider()
+
+        logger.debug(
+            "DocSelector init  model=%s  provider=%s",
+            self.model,
+            self.llm_provider.provider_name,
         )
-        logger.debug("DocSelector init  model=%s", self.model)
 
     async def select(
         self,
@@ -192,8 +206,7 @@ class DocSelector:
         )
 
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self.llm_provider.acompletion(
                 messages=[
                     {"role": "system", "content": SELECTOR_SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
@@ -362,9 +375,10 @@ async def select_documents(
     changelog_summary: str,
     all_doc_names: List[str],
     model: str = "qwen3-vl",
+    llm_provider: Optional["LLMProvider"] = None,
 ) -> DocSelection:
     """One-shot convenience function for document selection."""
-    selector = DocSelector(model=model)
+    selector = DocSelector(model=model, llm_provider=llm_provider)
     return await selector.select(
         original_query=original_query,
         sub_queries=sub_queries,

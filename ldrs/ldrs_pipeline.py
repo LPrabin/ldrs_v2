@@ -66,7 +66,12 @@ from ldrs.changelog import ChangeLog
 from ldrs.context_merger import ContextChunk, ContextMerger, MergedContext
 from ldrs.doc_registry import DocRegistry, build_entry
 from ldrs.doc_selector import DocSelector, DocSelection
-from ldrs.md_extractor import MdExtractor
+from ldrs.llm_provider import LLMProvider, get_provider
+from ldrs.pdf_extractor import (
+    PdfExtractor,
+    build_line_to_page_map,
+    map_structure_pages,
+)
 from ldrs.query_expander import ExpandedQuery, QueryExpander
 from ldrs.tree_grep import TreeGrep, GrepResult
 from rag.context_fetcher import ContextFetcher
@@ -94,7 +99,10 @@ class LDRSConfig:
                          ``results_dir`` if not specified).
         registry_path:   Path to the ``_registry.json`` file (auto-generated).
         changelog_path:  Path to the ``_changelog.json`` file (auto-generated).
+        provider:        LLM provider name ("local", "openai", "gemini").
+                         If None, reads from ``LLM_PROVIDER`` env var.
         model:           Default LLM model name for all LLM-calling stages.
+                         If None, the provider's default model is used.
         max_sub_queries: Max sub-queries from QueryExpander.
         min_sub_queries: Min sub-queries from QueryExpander.
         max_grep_results:  Max results per TreeGrep search.
@@ -114,6 +122,7 @@ class LDRSConfig:
     changelog_path: Optional[str] = None
 
     # LLM settings
+    provider: Optional[str] = None  # None → reads LLM_PROVIDER env var
     model: str = "qwen3-vl"
 
     # QueryExpander tuning
@@ -215,10 +224,17 @@ class LDRSPipeline:
     def __init__(self, config: LDRSConfig):
         self.config = config
         logger.info(
-            "LDRSPipeline init  results_dir=%s  pdf_dir=%s  model=%s",
+            "LDRSPipeline init  results_dir=%s  pdf_dir=%s  provider=%s  model=%s",
             config.results_dir,
             config.pdf_dir,
+            config.provider or "(env default)",
             config.model,
+        )
+
+        # Centralised LLM provider — shared by all LLM-calling components
+        self.llm_provider: LLMProvider = get_provider(
+            provider_name=config.provider,
+            model_override=config.model,
         )
 
         # Core components
@@ -242,6 +258,7 @@ class LDRSPipeline:
                 model=self.config.model,
                 max_sub_queries=self.config.max_sub_queries,
                 min_sub_queries=self.config.min_sub_queries,
+                llm_provider=self.llm_provider,
             )
         return self._query_expander
 
@@ -249,7 +266,10 @@ class LDRSPipeline:
     def doc_selector(self) -> DocSelector:
         """Lazy-init DocSelector."""
         if self._doc_selector is None:
-            self._doc_selector = DocSelector(model=self.config.model)
+            self._doc_selector = DocSelector(
+                model=self.config.model,
+                llm_provider=self.llm_provider,
+            )
         return self._doc_selector
 
     @property
@@ -259,6 +279,7 @@ class LDRSPipeline:
             self._generator = Generator(
                 model=self.config.model,
                 max_context_tokens=self.config.max_context_tokens,
+                llm_provider=self.llm_provider,
             )
         return self._generator
 
@@ -271,13 +292,9 @@ class LDRSPipeline:
         Scan the results directory and rebuild the registry + changelog.
 
         Scans for ``*_structure.json`` files, builds a registry entry for
-        each, auto-generates missing ``.md`` files from PDFs, and records
-        all documents in the changelog.
-
-        The auto-extraction step looks for documents where ``md_path`` is
-        ``None`` (no cached ``.md`` on disk).  For each, it tries to find
-        a matching PDF in ``pdf_dir`` and runs :class:`MdExtractor` to
-        produce the ``.md`` file, then updates the registry entry.
+        each, auto-generates missing ``.md`` files from PDFs using
+        :class:`PdfExtractor` (font-based heading detection, no LLM calls),
+        and records all documents in the changelog.
 
         Returns:
             Number of documents registered.
@@ -296,7 +313,7 @@ class LDRSPipeline:
         )
 
         # ------------------------------------------------------------------
-        # Auto-generate missing .md files from PDFs
+        # Auto-generate missing .md files from PDFs using PdfExtractor
         # ------------------------------------------------------------------
         md_generated = 0
         for doc_name in self.registry.doc_names:
@@ -317,10 +334,9 @@ class LDRSPipeline:
                 )
                 continue
 
-            # Extract .md from PDF + structure JSON
+            # Extract .md from PDF using PdfExtractor (no structure JSON needed)
             try:
-                extractor = MdExtractor(
-                    index_path=idx_path,
+                extractor = PdfExtractor(
                     pdf_path=pdf_path,
                     output_dir=self.config.md_dir,
                 )
@@ -393,6 +409,11 @@ class LDRSPipeline:
         """
         Index a single document: extract .md, register, and log.
 
+        Uses :class:`PdfExtractor` (font-based heading detection) to
+        extract markdown from the PDF.  The ``index_path`` (structure JSON)
+        is used for the DocRegistry and ChangeLog only — it is NOT needed
+        for the markdown extraction step.
+
         Args:
             pdf_path:    Path to the source PDF file.
             index_path:  Path to the ``*_structure.json`` file.
@@ -406,9 +427,8 @@ class LDRSPipeline:
             "LDRSPipeline.index_document  pdf=%s  index=%s", pdf_path, index_path
         )
 
-        # Extract markdown
-        extractor = MdExtractor(
-            index_path=index_path,
+        # Extract markdown using PdfExtractor (no structure JSON needed)
+        extractor = PdfExtractor(
             pdf_path=pdf_path,
             output_dir=self.config.md_dir,
         )
@@ -435,6 +455,162 @@ class LDRSPipeline:
             "LDRSPipeline.index_document  done  doc=%s  nodes=%d",
             doc_name,
             entry.get("node_count", 0),
+        )
+        return md_path
+
+    async def index_document_from_pdf(
+        self,
+        pdf_path: str,
+        output_dir: Optional[str] = None,
+        md_filename: Optional[str] = None,
+        if_add_node_summary: str = "no",
+        if_add_doc_description: str = "no",
+    ) -> str:
+        """
+        Generate a structure index from a raw PDF and ingest it into the corpus.
+
+        New flow (no heavy LLM-based PageIndex):
+
+        1. Run :class:`PdfExtractor` to extract full document text into
+           Markdown with font-based heading detection and ``<!-- page: N -->``
+           markers.
+        2. Run ``pageindex.page_index_md.md_to_tree()`` to parse the
+           Markdown headings into a hierarchical structure tree.
+        3. Run :func:`map_structure_pages` to convert ``line_num`` fields
+           into ``start_index`` / ``end_index`` (PDF page numbers) for
+           backward compatibility with TreeGrep, ContextFetcher, etc.
+        4. Save the structure JSON to ``{output_dir}/{stem}_structure.json``.
+        5. Register in DocRegistry and log to ChangeLog.
+
+        This replaces the old flow that used ``pageindex.page_index()``
+        (which required 20+ LLM calls for TOC detection, verification, etc.).
+
+        Args:
+            pdf_path:              Path to the source PDF file.
+            output_dir:            Directory to save outputs.
+                                   Defaults to ``config.results_dir``.
+            md_filename:           Custom ``.md`` filename.
+            if_add_node_summary:   "yes" to generate LLM summaries for nodes.
+            if_add_doc_description: "yes" to generate an LLM doc description.
+
+        Returns:
+            Path to the generated ``.md`` file.
+
+        Raises:
+            FileNotFoundError: If the PDF does not exist.
+            ValueError: If md_to_tree fails to produce a valid structure.
+        """
+        import unicodedata as _ud
+
+        if not os.path.isfile(pdf_path):
+            raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+        output_dir = output_dir or self.config.results_dir
+        md_output_dir = self.config.md_dir or output_dir
+        logger.info(
+            "LDRSPipeline.index_document_from_pdf  pdf=%s  output_dir=%s",
+            pdf_path,
+            output_dir,
+        )
+
+        # ---- Step 1: Extract PDF → Markdown using PdfExtractor ----
+        t0 = time.monotonic()
+        extractor = PdfExtractor(
+            pdf_path=pdf_path,
+            output_dir=md_output_dir,
+        )
+        md_path = extractor.extract(output_filename=md_filename)
+        elapsed_extract = time.monotonic() - t0
+
+        doc_name = _ud.normalize("NFC", os.path.basename(pdf_path))
+        stem = os.path.splitext(doc_name)[0]
+
+        logger.info(
+            "LDRSPipeline.index_document_from_pdf  md extracted  "
+            "doc=%s  md=%s  elapsed=%.1fs",
+            doc_name,
+            md_path,
+            elapsed_extract,
+        )
+
+        # ---- Step 2: Parse Markdown → structure tree via md_to_tree ----
+        t1 = time.monotonic()
+        from pageindex.page_index_md import md_to_tree
+
+        tree_result = await md_to_tree(
+            md_path=md_path,
+            if_add_node_summary=if_add_node_summary,
+            if_add_doc_description=if_add_doc_description,
+            if_add_node_id="yes",
+            model=self.config.model,
+        )
+        elapsed_tree = time.monotonic() - t1
+
+        if not tree_result or "structure" not in tree_result:
+            raise ValueError(
+                f"md_to_tree returned invalid result for {md_path}: {tree_result}"
+            )
+
+        structure = tree_result.get("structure", [])
+        logger.info(
+            "LDRSPipeline.index_document_from_pdf  md_to_tree done  "
+            "nodes=%d  elapsed=%.1fs",
+            len(structure),
+            elapsed_tree,
+        )
+
+        # ---- Step 3: Map line_num → start_index / end_index (page numbers) ----
+        with open(md_path, "r", encoding="utf-8") as f:
+            md_text = f.read()
+
+        line_to_page = build_line_to_page_map(md_text)
+        structure = map_structure_pages(structure, line_to_page, md_text)
+
+        logger.info(
+            "LDRSPipeline.index_document_from_pdf  page mapping done  "
+            "total_line_mappings=%d",
+            len(line_to_page),
+        )
+
+        # ---- Step 4: Build and save structure JSON ----
+        index_data = {
+            "doc_name": tree_result.get("doc_name", stem),
+        }
+        # Include doc_description if available
+        if tree_result.get("doc_description"):
+            index_data["doc_description"] = tree_result["doc_description"]
+        index_data["structure"] = structure
+
+        os.makedirs(output_dir, exist_ok=True)
+        index_path = os.path.join(output_dir, f"{stem}_structure.json")
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(index_data, f, indent=2, ensure_ascii=False)
+        logger.info(
+            "LDRSPipeline.index_document_from_pdf  saved structure: %s",
+            index_path,
+        )
+
+        # ---- Step 5: Register in DocRegistry + ChangeLog ----
+        entry = self.registry.add_or_update(index_path, md_path)
+        self.registry.save()
+
+        reg_doc_name = entry.get("doc_name", doc_name)
+        self.changelog.record_indexed(
+            doc_name=reg_doc_name,
+            index_data=index_data,
+            structure=structure,
+        )
+        self.changelog.save()
+
+        total_elapsed = time.monotonic() - t0
+        logger.info(
+            "LDRSPipeline.index_document_from_pdf  complete  doc=%s  md=%s  "
+            "index=%s  nodes=%d  total=%.1fs",
+            reg_doc_name,
+            md_path,
+            index_path,
+            entry.get("node_count", 0),
+            total_elapsed,
         )
         return md_path
 

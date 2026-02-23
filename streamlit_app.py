@@ -29,6 +29,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from ldrs.ldrs_pipeline import LDRSConfig, LDRSPipeline, LDRSResult
+from ldrs.llm_provider import list_available_providers, get_provider_info
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -91,6 +92,7 @@ def _init_session_state():
         "pdf_dir": "tests/pdfs",
         "md_dir": "",
         "model": "qwen3-vl",
+        "provider": None,  # None → use LLM_PROVIDER env var default
         "max_sub_queries": 5,
         "min_sub_queries": 3,
         "max_grep_results": 30,
@@ -132,6 +134,33 @@ def render_sidebar():
     )
 
     st.sidebar.subheader("LLM Settings")
+
+    # Provider selector
+    available_providers = list_available_providers()
+    provider_options = ["(default)"] + available_providers
+    current_idx = 0
+    if st.session_state.provider and st.session_state.provider in available_providers:
+        current_idx = provider_options.index(st.session_state.provider)
+    selected_provider = st.sidebar.selectbox(
+        "LLM Provider",
+        provider_options,
+        index=current_idx,
+        help="Select the LLM provider. '(default)' uses the LLM_PROVIDER env var.",
+    )
+    st.session_state.provider = (
+        None if selected_provider == "(default)" else selected_provider
+    )
+
+    # Provider info
+    if available_providers:
+        all_info = get_provider_info()
+        with st.sidebar.expander("Provider details"):
+            for pname, pinfo in all_info.items():
+                status = "configured" if pinfo.get("configured") else "not configured"
+                st.markdown(
+                    f"- **{pname}**: {status} (model: `{pinfo.get('model', 'N/A')}`)"
+                )
+
     st.session_state.model = st.sidebar.text_input(
         "Model",
         value=st.session_state.model,
@@ -199,6 +228,7 @@ def _build_config() -> LDRSConfig:
         pdf_dir=st.session_state.pdf_dir,
         md_dir=md_dir,
         model=st.session_state.model,
+        provider=st.session_state.provider,
         max_sub_queries=st.session_state.max_sub_queries,
         min_sub_queries=st.session_state.min_sub_queries,
         max_grep_results=st.session_state.max_grep_results,
@@ -600,7 +630,118 @@ def render_indexing_tab():
 
 
 # ---------------------------------------------------------------------------
-# Tab 4: Batch Query
+# Tab 4: PageIndex (PDF → Structure → Register)
+# ---------------------------------------------------------------------------
+def render_pageindex_tab():
+    """Render the PageIndex interface for indexing raw PDFs."""
+    st.header("PageIndex — Index from Raw PDF")
+
+    if st.session_state.pipeline is None:
+        st.warning("Pipeline not initialised. Use the sidebar to build it first.")
+        return
+
+    st.markdown(
+        "Run **PageIndex** on a raw PDF to automatically generate a structure JSON, "
+        "extract markdown, and register the document in the corpus. "
+        "This is the full pipeline from a raw PDF to a corpus-ready document."
+    )
+
+    # File path input
+    pdf_path = st.text_input(
+        "PDF file path",
+        placeholder="/path/to/document.pdf",
+        help="Absolute or relative path to the PDF file.",
+        key="pageindex_pdf_path",
+    )
+    output_dir = st.text_input(
+        "Output directory (optional)",
+        placeholder=f"Defaults to: {st.session_state.results_dir}",
+        help="Directory to save the structure JSON and .md files.",
+        key="pageindex_output_dir",
+    )
+    md_filename = st.text_input(
+        "Custom .md filename (optional)",
+        placeholder="Leave blank for auto-naming",
+        help="If blank, the doc_name from the generated index is used.",
+        key="pageindex_md_filename",
+    )
+
+    if st.button("Run PageIndex", type="primary", key="run_pageindex"):
+        if not pdf_path.strip():
+            st.error("PDF file path is required.")
+            return
+
+        if not os.path.exists(pdf_path.strip()):
+            st.error(f"PDF file not found: {pdf_path}")
+            return
+
+        out_dir = output_dir.strip() or None
+        md_fn = md_filename.strip() or None
+        pipeline = st.session_state.pipeline
+
+        with st.spinner(
+            "Running PageIndex (this may take a while for large PDFs — "
+            "involves LLM calls for structure analysis)..."
+        ):
+            try:
+                md_path = run_async(
+                    pipeline.index_document_from_pdf(
+                        pdf_path=pdf_path.strip(),
+                        output_dir=out_dir,
+                        md_filename=md_fn,
+                    )
+                )
+                st.success(
+                    f"Document indexed successfully!\n\n"
+                    f"Markdown file: `{md_path}`\n\n"
+                    f"Corpus now has "
+                    f"**{len(pipeline.registry.doc_names)}** documents."
+                )
+            except Exception as e:
+                st.error(f"PageIndex failed: {e}")
+                logger.exception("PageIndex indexing failed")
+
+    # Quick-index from Nepalidocs
+    st.divider()
+    st.subheader("Quick Index — Nepali Documents")
+    st.markdown("Select a PDF from the `Nepalidocs/` folder to run PageIndex on it.")
+
+    nepali_dir = os.path.join(PROJECT_ROOT, "Nepalidocs")
+    if os.path.isdir(nepali_dir):
+        pdf_files = sorted(
+            [f for f in os.listdir(nepali_dir) if f.lower().endswith(".pdf")]
+        )
+        if pdf_files:
+            selected = st.selectbox("Nepali PDF", pdf_files, key="nepali_pdf_select")
+            if selected and st.button(
+                "Run PageIndex on Selected",
+                use_container_width=True,
+                key="run_pageindex_nepali",
+            ):
+                full_path = os.path.join(nepali_dir, selected)
+                out_dir = os.path.join(nepali_dir, "index")
+                os.makedirs(out_dir, exist_ok=True)
+
+                with st.spinner(f"Running PageIndex on {selected}..."):
+                    try:
+                        md_path = run_async(
+                            st.session_state.pipeline.index_document_from_pdf(
+                                pdf_path=full_path,
+                                output_dir=out_dir,
+                            )
+                        )
+                        st.success(f"Indexed: `{md_path}`")
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
+                        logger.exception("Nepali PageIndex failed")
+        else:
+            st.info("No PDF files found in Nepalidocs/")
+    else:
+        st.info("Nepalidocs/ directory not found.")
+
+
+# ---------------------------------------------------------------------------
+# Tab 5: Batch Query
 # ---------------------------------------------------------------------------
 def render_batch_tab():
     """Render the batch query interface."""
@@ -672,8 +813,10 @@ def main():
     # Status bar
     if st.session_state.pipeline is not None and st.session_state.corpus_built:
         stats = st.session_state.pipeline.corpus_stats()
+        provider_label = st.session_state.pipeline.llm_provider.provider_name
         st.success(
-            f"Pipeline active | Model: `{st.session_state.model}` | "
+            f"Pipeline active | Provider: `{provider_label}` | "
+            f"Model: `{st.session_state.model}` | "
             f"Corpus: {stats['num_documents']} documents"
         )
     else:
@@ -683,11 +826,12 @@ def main():
         )
 
     # Main tabs
-    tab_query, tab_corpus, tab_index, tab_batch = st.tabs(
+    tab_query, tab_corpus, tab_index, tab_pageindex, tab_batch = st.tabs(
         [
             "Query",
             "Corpus",
             "Index Document",
+            "PageIndex (PDF)",
             "Batch Query",
         ]
     )
@@ -700,6 +844,9 @@ def main():
 
     with tab_index:
         render_indexing_tab()
+
+    with tab_pageindex:
+        render_pageindex_tab()
 
     with tab_batch:
         render_batch_tab()

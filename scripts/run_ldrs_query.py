@@ -15,11 +15,15 @@ Usage:
         --pdf-dir tests/pdfs \\
         --query "Explain the EMD algorithm"
 
+    # Use a specific LLM provider
+    python scripts/run_ldrs_query.py --provider openai --query "What is EMD?"
+
     # Verbose logging
     python scripts/run_ldrs_query.py --verbose --query "inflation rate"
 
 Environment:
     Requires API_KEY and BASE_URL in .env (loaded automatically).
+    For multi-provider support, set LOCAL_*, OPENAI_*, GEMINI_* vars.
 """
 
 import argparse
@@ -201,6 +205,14 @@ async def main() -> None:
         help="LLM model name (default: qwen3-vl).",
     )
     parser.add_argument(
+        "--provider",
+        "-p",
+        type=str,
+        default=None,
+        choices=["local", "openai", "gemini"],
+        help="LLM provider to use (default: reads LLM_PROVIDER env var).",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -221,10 +233,13 @@ async def main() -> None:
         pdf_dir=args.pdf_dir,
         md_dir=args.md_dir,
         model=args.model,
+        provider=args.provider,
     )
 
     # Initialize pipeline
     print("Initialising LDRS v2 pipeline...")
+    if args.provider:
+        print(f"Using LLM provider: {args.provider}")
     pipeline = LDRSPipeline(config)
 
     print(f"Building corpus from {config.results_dir} ...")

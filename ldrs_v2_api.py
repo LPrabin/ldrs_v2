@@ -11,6 +11,8 @@ Endpoints:
     GET  /corpus/stats       — Get corpus statistics.
     POST /corpus/rebuild     — Rebuild the corpus registry.
     POST /index              — Index a single document (extract .md + register).
+    POST /index-pdf          — Index a raw PDF (PageIndex + extract .md + register).
+    GET  /providers           — List available LLM providers.
     GET  /health             — Health check.
 
 Usage::
@@ -25,6 +27,11 @@ Usage::
     curl -X POST http://localhost:8001/query \\
         -H 'Content-Type: application/json' \\
         -d '{"query": "What is Earth Mover\\'s Distance?"}'
+
+    # Query with a specific provider
+    curl -X POST http://localhost:8001/query \\
+        -H 'Content-Type: application/json' \\
+        -d '{"query": "What is EMD?", "provider": "openai"}'
 """
 
 import logging
@@ -45,6 +52,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from ldrs.ldrs_pipeline import LDRSConfig, LDRSPipeline, LDRSResult
+from ldrs.llm_provider import (
+    LLMProvider,
+    get_provider,
+    clear_provider_cache,
+    list_available_providers,
+    get_provider_info,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -80,6 +94,13 @@ class QueryRequest(BaseModel):
 
     query: str = Field(..., description="The natural-language question.")
     model: Optional[str] = Field(None, description="Override LLM model (optional).")
+    provider: Optional[str] = Field(
+        None,
+        description=(
+            "LLM provider to use for this query ('local', 'openai', 'gemini'). "
+            "If omitted, uses the server's default provider."
+        ),
+    )
 
 
 class BatchQueryRequest(BaseModel):
@@ -107,6 +128,22 @@ class IndexRequest(BaseModel):
 
     pdf_path: str = Field(..., description="Path to the PDF file.")
     index_path: str = Field(..., description="Path to the *_structure.json file.")
+    md_filename: Optional[str] = Field(
+        None, description="Custom .md filename (optional)."
+    )
+
+
+class IndexPdfRequest(BaseModel):
+    """Request body for /index-pdf (raw PDF → PageIndex → register)."""
+
+    pdf_path: str = Field(..., description="Path to the PDF file.")
+    output_dir: Optional[str] = Field(
+        None,
+        description=(
+            "Directory to save structure JSON and .md files. "
+            "Defaults to the pipeline's results_dir."
+        ),
+    )
     md_filename: Optional[str] = Field(
         None, description="Custom .md filename (optional)."
     )
@@ -190,6 +227,19 @@ async def startup_event():
         PORT,
     )
 
+    # Log available LLM providers
+    available = list_available_providers()
+    logger.info("Available LLM providers: %s", ", ".join(available) or "(none)")
+    all_info = get_provider_info()
+    for pname in available:
+        info = all_info.get(pname, {})
+        logger.info(
+            "  %s: model=%s  has_base_url=%s",
+            pname,
+            info.get("model", "N/A"),
+            info.get("has_base_url", False),
+        )
+
     config = LDRSConfig(
         results_dir=RESULTS_DIR,
         pdf_dir=PDF_DIR,
@@ -204,6 +254,11 @@ async def startup_event():
     elapsed = time.monotonic() - t0
 
     logger.info("Corpus built: %d documents in %.2fs", count, elapsed)
+    logger.info(
+        "Default provider: %s (model: %s)",
+        pipeline.llm_provider.config.name,
+        pipeline.llm_provider.model,
+    )
     logger.info("LDRS v2 API ready on port %d", PORT)
 
 
@@ -233,13 +288,49 @@ async def query_endpoint(request: QueryRequest):
     3. Per-doc retrieval (TreeGrep + ContextFetcher)
     4. Context merging (rank, dedup, budget)
     5. Answer generation (LLM)
+
+    Optionally pass ``provider`` ("local", "openai", "gemini") to use
+    a specific LLM provider for this query.
     """
     if not pipeline:
         raise HTTPException(status_code=503, detail="Pipeline not initialised")
 
-    logger.info("POST /query  query=%r", request.query)
-    result = await pipeline.query(request.query)
-    return _result_to_response(result)
+    logger.info(
+        "POST /query  query=%r  provider=%s",
+        request.query,
+        request.provider or "(default)",
+    )
+
+    # Temporarily switch provider if requested
+    original_provider = None
+    if request.provider:
+        try:
+            new_provider = get_provider(
+                provider_name=request.provider,
+                model_override=request.model,
+            )
+            original_provider = pipeline.llm_provider
+            pipeline.llm_provider = new_provider
+            # Update lazy-init components so they use the new provider
+            pipeline._query_expander = None
+            pipeline._doc_selector = None
+            pipeline._generator = None
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid provider '{request.provider}': {e}",
+            )
+
+    try:
+        result = await pipeline.query(request.query)
+        return _result_to_response(result)
+    finally:
+        # Restore original provider if we switched
+        if original_provider is not None:
+            pipeline.llm_provider = original_provider
+            pipeline._query_expander = None
+            pipeline._doc_selector = None
+            pipeline._generator = None
 
 
 @app.post("/batch-query", response_model=List[QueryResponse])
@@ -322,6 +413,67 @@ async def index_document(request: IndexRequest):
     except Exception as e:
         logger.exception("POST /index  error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/index-pdf")
+async def index_pdf_endpoint(request: IndexPdfRequest):
+    """
+    Index a raw PDF: extract markdown via PdfExtractor (font-based heading
+    detection), parse headings into a structure tree via md_to_tree, map
+    line numbers to page numbers, register in the corpus, and log to the
+    changelog.
+
+    This is the full pipeline from raw PDF to corpus-ready document.
+    No heavy LLM calls are needed unless summaries are requested.
+    """
+    if not pipeline:
+        raise HTTPException(status_code=503, detail="Pipeline not initialised")
+
+    if not os.path.exists(request.pdf_path):
+        raise HTTPException(
+            status_code=404, detail=f"PDF not found: {request.pdf_path}"
+        )
+
+    output_dir = request.output_dir or pipeline.config.results_dir
+    logger.info("POST /index-pdf  pdf=%s  output_dir=%s", request.pdf_path, output_dir)
+
+    try:
+        md_path = await pipeline.index_document_from_pdf(
+            pdf_path=request.pdf_path,
+            output_dir=output_dir,
+            md_filename=request.md_filename,
+        )
+        return {
+            "status": "ok",
+            "md_path": md_path,
+            "corpus_docs": len(pipeline.registry.doc_names),
+        }
+    except Exception as e:
+        logger.exception("POST /index-pdf  error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/providers")
+async def providers_endpoint():
+    """
+    List available LLM providers and their configuration status.
+
+    Returns all supported providers with info about which ones are
+    properly configured and ready to use.
+    """
+    available = list_available_providers()
+    all_info = get_provider_info()
+
+    # Add the current default provider
+    default_provider = None
+    if pipeline:
+        default_provider = pipeline.llm_provider.provider_name
+
+    return {
+        "default_provider": default_provider,
+        "available": available,
+        "providers": all_info,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -5,19 +5,21 @@ Takes a single user query and generates 3-5 sub-queries that cover different
 angles, interpretations, and specificity levels. This improves recall by
 ensuring downstream search hits more relevant sections across documents.
 
-Uses AsyncOpenAI (same client pattern as existing RAG modules).
+Uses LLMProvider (centralized multi-provider LLM client via LiteLLM).
 """
 
 import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
-import openai
 from dotenv import load_dotenv
 
 load_dotenv()
+
+if TYPE_CHECKING:
+    from ldrs.llm_provider import LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -87,17 +89,24 @@ class QueryExpander:
         model: str = "qwen3-vl",
         max_sub_queries: int = 5,
         min_sub_queries: int = 3,
+        llm_provider: Optional["LLMProvider"] = None,
     ):
         self.model = model
         self.max_sub_queries = max_sub_queries
         self.min_sub_queries = min_sub_queries
-        self.client = openai.AsyncOpenAI(
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("BASE_URL"),
-        )
+
+        if llm_provider is not None:
+            self.llm_provider = llm_provider
+        else:
+            # Lazy import to avoid circular dependency at module level
+            from ldrs.llm_provider import get_provider
+
+            self.llm_provider = get_provider()
+
         logger.debug(
-            "QueryExpander init  model=%s  max_sub=%d  min_sub=%d",
+            "QueryExpander init  model=%s  provider=%s  max_sub=%d  min_sub=%d",
             self.model,
+            self.llm_provider.provider_name,
             self.max_sub_queries,
             self.min_sub_queries,
         )
@@ -117,8 +126,7 @@ class QueryExpander:
         logger.info("QueryExpander.expand  query=%r", query)
 
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self.llm_provider.acompletion(
                 messages=[
                     {"role": "system", "content": EXPANSION_SYSTEM_PROMPT},
                     {
@@ -222,7 +230,8 @@ class QueryExpander:
 async def expand_query(
     query: str,
     model: str = "qwen3-vl",
+    llm_provider: Optional["LLMProvider"] = None,
 ) -> ExpandedQuery:
     """One-shot convenience function for query expansion."""
-    expander = QueryExpander(model=model)
+    expander = QueryExpander(model=model, llm_provider=llm_provider)
     return await expander.expand(query)

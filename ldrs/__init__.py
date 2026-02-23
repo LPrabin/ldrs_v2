@@ -2,7 +2,8 @@
 LDRS v2 — Living Document RAG System
 
 Modules (built incrementally):
-  - md_extractor:   PDF → structured Markdown with node metadata  (Step 1)
+  - llm_provider:   Centralized multi-provider LLM client (LiteLLM)
+  - pdf_extractor:  PDF → Markdown with font-based heading detection (Step 1)
   - doc_telescope:  Structural context builder (carried from v1)
   - doc_registry:   Corpus inventory / TOC                        (Step 2)
   - changelog:      Corpus file ledger                             (Step 2)
@@ -13,7 +14,20 @@ Modules (built incrementally):
   - ldrs_pipeline:  End-to-end v2 orchestration                   (Step 5)
 """
 
-from ldrs.md_extractor import MdExtractor, extract_markdown
+from ldrs.llm_provider import (
+    LLMProvider,
+    ProviderConfig,
+    get_provider,
+    clear_provider_cache,
+    list_available_providers,
+    get_provider_info,
+)
+from ldrs.pdf_extractor import (
+    PdfExtractor,
+    extract_pdf_to_markdown,
+    build_line_to_page_map,
+    map_structure_pages,
+)
 from ldrs.doc_telescope import DocTelescope, TelescopeView
 from ldrs.doc_registry import DocRegistry, build_entry
 from ldrs.changelog import ChangeLog, compute_structural_diff
@@ -24,9 +38,18 @@ from ldrs.context_merger import ContextMerger, ContextChunk, MergedContext
 from ldrs.ldrs_pipeline import LDRSPipeline, LDRSConfig, LDRSResult
 
 __all__ = [
-    # Step 1
-    "MdExtractor",
-    "extract_markdown",
+    # LLM Provider
+    "LLMProvider",
+    "ProviderConfig",
+    "get_provider",
+    "clear_provider_cache",
+    "list_available_providers",
+    "get_provider_info",
+    # Step 1 — PDF extraction
+    "PdfExtractor",
+    "extract_pdf_to_markdown",
+    "build_line_to_page_map",
+    "map_structure_pages",
     # v1 carry-over
     "DocTelescope",
     "TelescopeView",
