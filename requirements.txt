@@ -10,3 +10,7 @@ uvicorn==0.34.3
 streamlit==1.54.0
 pytest==8.4.1
 pytest-asyncio==1.0.0
+paddleocr==2.8.1
+pdf2image
+numpy
+paddlepaddle==2.6.2

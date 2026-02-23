@@ -29,12 +29,17 @@ Usage::
 
 import logging
 import os
+import re
+import subprocess
 import unicodedata
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
+import numpy as np
+from paddleocr import PaddleOCR
+from pdf2image import convert_from_path
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +90,12 @@ class PdfExtractor:
         self,
         pdf_path: str,
         output_dir: Optional[str] = None,
+        use_ocr: bool = False,
     ):
         self.pdf_path = pdf_path
         self.output_dir = output_dir or os.path.dirname(pdf_path) or "."
         self.doc_name = os.path.basename(pdf_path)
+        self.use_ocr = use_ocr
 
         logger.debug(
             "PdfExtractor init  pdf=%s  output_dir=%s",
@@ -342,55 +349,215 @@ class PdfExtractor:
         return "\n".join(cleaned)
 
     # ------------------------------------------------------------------
+    # OCR Fallback for Nepali documents
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_nepali_unicode(text: str) -> bool:
+        """
+        Check if the string contains a significant amount of Nepali Unicode characters.
+
+        Standard extraction (fitz/PyMuPDF) often succeeds in extracting some
+        metadata or small portions in Unicode even if the main body is in a
+        legacy font (like Preeti). We check the ratio of Nepali characters
+        to ensure the extraction was truly successful for the content.
+        """
+        # We only check a sample if the text is very large
+        sample = text[:10000]
+        clean_sample = re.sub(r"\s+", "", sample)
+        if not clean_sample:
+            return True
+
+        nepali_chars = len(re.findall(r"[\u0900-\u097F]", clean_sample))
+        ratio = nepali_chars / len(clean_sample)
+
+        # If more than 15% of characters are Nepali Unicode, we assume it's good.
+        # (Nepali text usually has a high ratio of characters in this range).
+        if ratio > 0.15:
+            return True
+
+        # If we have very few Nepali characters, check for legacy font indicators.
+        # Pipe symbol '|' is frequently used as a danda '।' in legacy fonts.
+        # Other common symbols: '÷', '×', '§', '°'
+        legacy_markers = ["|", "÷", "§", "°", "¶"]
+        has_legacy_markers = any(m in sample for m in legacy_markers)
+
+        if ratio < 0.05 and has_legacy_markers:
+            return False
+
+        # If no Nepali characters at all, it might be English.
+        # We check if there's any non-ASCII text.
+        if nepali_chars == 0:
+            # If it's purely ASCII, we assume English/Compatible and return True
+            # unless it has legacy markers.
+            return not has_legacy_markers
+
+        # If ratio is low (e.g. 1-5%) and no legacy markers, it might be a
+        # document with very little Nepali text. We'll be conservative.
+        return ratio > 0.10
+
+    def _extract_text_with_ocr(
+        self, progress_callback: Optional[Callable[[int, int, str], None]] = None
+    ) -> Tuple[str, str]:
+        """
+        Extract text and tables from the PDF using OCR as a fallback.
+
+        Returns:
+            A tuple containing the main markdown content and the table markdown content.
+        """
+        logger.info("Falling back to OCR for PDF: %s", self.pdf_path)
+        if progress_callback:
+            progress_callback(0, 1, "Initializing OCR engine...")
+        try:
+            # Check for pdftoppm
+            subprocess.run(["pdftoppm", "-h"], capture_output=True, check=False)
+        except FileNotFoundError:
+            logger.error(
+                "Poppler (pdftoppm) not found. Please install poppler-utils to use the OCR fallback."
+            )
+            return "", ""
+
+        images = convert_from_path(self.pdf_path)
+
+        # Initialize PaddleOCR for text extraction
+        # Note: lang='ne' is for Nepali
+        ocr = PaddleOCR(use_angle_cls=True, lang="ne", show_log=False)
+
+        # Initialize PaddleOCR for table/structure extraction
+        # We use PP-Structure for table recognition
+        from paddleocr import PPStructure
+
+        try:
+            table_engine = PPStructure(
+                show_log=False, lang="en", layout=False, table=True
+            )
+        except Exception as e:
+            logger.error("Failed to initialize PPStructure: %s", e)
+            table_engine = None
+
+        full_text = []
+        table_text = []
+        total_pages = len(images)
+
+        for i, image in enumerate(images):
+            if progress_callback:
+                progress_callback(
+                    i + 1,
+                    total_pages,
+                    f"Extracting text from page {i + 1} of {total_pages} using OCR...",
+                )
+
+            image_np = np.array(image)
+
+            # Extract text
+            result = ocr.ocr(image_np, cls=True)
+            full_text.append(f"<!-- page: {i + 1} -->")
+            if result and result[0] is not None:
+                # result[0] is a list of [box, (text, confidence)]
+                texts = [line[1][0] for line in result[0]]
+                full_text.extend(texts)
+            full_text.append("")
+
+            # Extract tables using PPStructure if available
+            if table_engine:
+                if progress_callback:
+                    progress_callback(
+                        i + 1,
+                        total_pages,
+                        f"Extracting tables from page {i + 1} of {total_pages} using OCR...",
+                    )
+                try:
+                    table_result = table_engine(image_np)
+                    if table_result:
+                        for res in table_result:
+                            if res["type"] == "table":
+                                table_text.append(f"<!-- page: {i + 1} -->")
+                                if "html" in res["res"]:
+                                    table_text.append(res["res"]["html"])
+                                table_text.append("")
+                except Exception as e:
+                    logger.warning("Table extraction failed for page %d: %s", i + 1, e)
+
+        if progress_callback:
+            progress_callback(total_pages, total_pages, "OCR Extraction complete.")
+
+        return "\n".join(full_text), "\n".join(table_text)
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def extract_to_string(self) -> str:
-        """
-        Extract PDF text and return the full Markdown as a string.
-
-        Heading detection is done via font-size analysis.  Page markers
-        (``<!-- page: N -->``) are embedded for downstream page-number
-        mapping.
-
-        Returns:
-            Markdown string with headings and page markers.
-        """
-        logger.info("PdfExtractor.extract_to_string  start  pdf=%s", self.pdf_path)
-
+    def _extract_standard(
+        self, progress_callback: Optional[Callable[[int, int, str], None]] = None
+    ) -> str:
+        """Internal method for standard (non-OCR) extraction."""
         doc = fitz.open(self.pdf_path)
         total_pages = len(doc)
-        logger.debug("PdfExtractor  total PDF pages=%d", total_pages)
 
-        # Step 1: Analyse fonts across entire document
+        if progress_callback:
+            progress_callback(0, total_pages, "Analyzing fonts...")
+
         body_size, heading_sizes = self._analyse_fonts(doc)
 
-        # Step 2: Extract each page with heading annotations
         page_lines: Dict[int, List[Dict[str, Any]]] = {}
         for page_num in range(total_pages):
+            if progress_callback:
+                progress_callback(
+                    page_num + 1,
+                    total_pages,
+                    f"Extracting standard text from page {page_num + 1} of {total_pages}...",
+                )
             page = doc[page_num]
             lines = self._extract_page_with_fonts(page, heading_sizes, body_size)
-            page_lines[page_num + 1] = lines  # 1-based
+            page_lines[page_num + 1] = lines
 
         doc.close()
 
-        # Step 3: Convert to markdown
-        raw_md = self._lines_to_markdown(page_lines)
+        if progress_callback:
+            progress_callback(total_pages, total_pages, "Cleaning extracted text...")
 
-        # Step 4: Clean up excessive blank lines
-        md_content = self._clean_text(raw_md)
+        raw_md = self._lines_to_markdown(page_lines)
+        return self._clean_text(raw_md)
+
+    def extract_to_string(
+        self, progress_callback: Optional[Callable[[int, int, str], None]] = None
+    ) -> str:
+        """
+        Extract PDF text and return the full Markdown as a string.
+
+        If `use_ocr` is True, uses PaddleOCR for text extraction and PP-Structure for table extraction.
+        Otherwise, uses standard PyMuPDF font-based extraction.
+        Page markers (``<!-- page: N -->``) are embedded for downstream page-number
+        mapping.
+
+        Returns:
+            Markdown string with text and page markers.
+        """
+        if self.use_ocr:
+            logger.info(
+                "PdfExtractor.extract_to_string  start (OCR)  pdf=%s", self.pdf_path
+            )
+            md_content, _ = self._extract_text_with_ocr(
+                progress_callback=progress_callback
+            )
+        else:
+            logger.info(
+                "PdfExtractor.extract_to_string  start (Standard)  pdf=%s",
+                self.pdf_path,
+            )
+            md_content = self._extract_standard(progress_callback=progress_callback)
 
         logger.info(
-            "PdfExtractor.extract_to_string  done  pages=%d  chars=%d  "
-            "heading_sizes=%s  body_size=%.1f",
-            total_pages,
+            "PdfExtractor.extract_to_string  done  chars=%d",
             len(md_content),
-            heading_sizes,
-            body_size,
         )
         return md_content
 
-    def extract(self, output_filename: Optional[str] = None) -> str:
+    def extract(
+        self,
+        output_filename: Optional[str] = None,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> str:
         """
         Extract PDF text and write the Markdown to a file.
 
@@ -404,21 +571,37 @@ class PdfExtractor:
         if output_filename is None:
             stem = Path(self.doc_name).stem
             output_filename = f"{stem}.md"
+            table_output_filename = f"{stem}_tables.md"
+        else:
+            stem = Path(output_filename).stem
+            table_output_filename = f"{stem}_tables.md"
 
         output_path = os.path.join(self.output_dir, output_filename)
-        logger.info("PdfExtractor.extract  writing to %s", output_path)
+        table_output_path = os.path.join(self.output_dir, table_output_filename)
 
-        md_content = self.extract_to_string()
+        if self.use_ocr:
+            logger.info("PdfExtractor.extract  processing %s (OCR)", self.pdf_path)
+            md_content, table_content = self._extract_text_with_ocr(
+                progress_callback=progress_callback
+            )
+        else:
+            logger.info("PdfExtractor.extract  processing %s (Standard)", self.pdf_path)
+            md_content = self._extract_standard(progress_callback=progress_callback)
+            table_content = ""
 
+        # 3. Save results
         os.makedirs(self.output_dir, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(md_content)
 
-        file_size = os.path.getsize(output_path)
+        if table_content:
+            with open(table_output_path, "w", encoding="utf-8") as f:
+                f.write(table_content)
+            logger.info("PdfExtractor.extract  saved tables to %s", table_output_path)
+
         logger.info(
-            "PdfExtractor.extract  done  path=%s  size=%d bytes",
+            "PdfExtractor.extract  done  path=%s",
             output_path,
-            file_size,
         )
         return output_path
 
@@ -533,6 +716,7 @@ def extract_pdf_to_markdown(
     pdf_path: str,
     output_dir: Optional[str] = None,
     output_filename: Optional[str] = None,
+    use_ocr: bool = False,
 ) -> str:
     """
     Convenience function: extract PDF to Markdown in one call.
@@ -543,5 +727,6 @@ def extract_pdf_to_markdown(
     extractor = PdfExtractor(
         pdf_path=pdf_path,
         output_dir=output_dir,
+        use_ocr=use_ocr,
     )
     return extractor.extract(output_filename=output_filename)

@@ -121,6 +121,7 @@ class QueryResponse(BaseModel):
     timings: Dict[str, float]
     error: str = ""
     merged_context_stats: Optional[Dict[str, Any]] = None
+    usage_stats: Optional[Dict[str, Any]] = None
 
 
 class IndexRequest(BaseModel):
@@ -130,6 +131,9 @@ class IndexRequest(BaseModel):
     index_path: str = Field(..., description="Path to the *_structure.json file.")
     md_filename: Optional[str] = Field(
         None, description="Custom .md filename (optional)."
+    )
+    use_ocr: bool = Field(
+        False, description="Extract text using OCR rather than font-based extraction."
     )
 
 
@@ -146,6 +150,10 @@ class IndexPdfRequest(BaseModel):
     )
     md_filename: Optional[str] = Field(
         None, description="Custom .md filename (optional)."
+    )
+    use_ocr: bool = Field(
+        False,
+        description="Extract text using OCR rather than font-based extraction. Essential for documents containing Devanagari script.",
     )
 
 
@@ -185,6 +193,7 @@ def _result_to_response(result: LDRSResult) -> QueryResponse:
         timings=result.timings,
         error=result.error,
         merged_context_stats=merged_stats,
+        usage_stats=getattr(result, "usage_stats", None),
     )
 
 
@@ -404,6 +413,7 @@ async def index_document(request: IndexRequest):
             pdf_path=request.pdf_path,
             index_path=request.index_path,
             md_filename=request.md_filename,
+            use_ocr=request.use_ocr,
         )
         return {
             "status": "ok",
@@ -442,6 +452,7 @@ async def index_pdf_endpoint(request: IndexPdfRequest):
             pdf_path=request.pdf_path,
             output_dir=output_dir,
             md_filename=request.md_filename,
+            use_ocr=request.use_ocr,
         )
         return {
             "status": "ok",

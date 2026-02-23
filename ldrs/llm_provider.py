@@ -293,6 +293,53 @@ class LLMProvider:
         )
         return litellm.completion(**call_kwargs)
 
+    @staticmethod
+    def get_usage_and_cost(response: Any) -> Dict[str, Any]:
+        """
+        Extract usage stats and calculate cost from a LiteLLM response.
+
+        Args:
+            response: The response object from completion/acompletion.
+
+        Returns:
+            Dict with keys:
+            - prompt_tokens (int)
+            - completion_tokens (int)
+            - total_tokens (int)
+            - cost (float) - estimated cost in USD
+        """
+        usage = getattr(response, "usage", {})
+        # Handle object access if usage is a Pydantic model or similar
+        if not isinstance(usage, dict):
+            # Try converting to dict if possible, otherwise access attributes
+            try:
+                usage = usage.dict()
+            except AttributeError:
+                # Fallback to direct attribute access if it's an object
+                usage = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                    "completion_tokens": getattr(usage, "completion_tokens", 0),
+                    "total_tokens": getattr(usage, "total_tokens", 0),
+                }
+
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tokens = usage.get("total_tokens", 0)
+
+        cost = 0.0
+        try:
+            # litellm.completion_cost handles various response formats
+            cost = litellm.completion_cost(completion_response=response)
+        except Exception as e:
+            logger.warning("Failed to calculate cost: %s", e)
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cost": float(cost),
+        }
+
     def get_available_providers(self) -> List[str]:
         """
         Return list of configured (usable) provider names.

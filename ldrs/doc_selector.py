@@ -18,7 +18,7 @@ import logging
 import os
 import unicodedata
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Dict, Any
 
 from dotenv import load_dotenv
 
@@ -90,6 +90,7 @@ class DocSelection:
     selected_docs: List[str]
     reasoning: str = ""
     all_docs: List[str] = field(default_factory=list)
+    usage: Dict[str, Any] = field(default_factory=dict)  # prompt_tokens, completion_tokens, total_tokens, cost
 
     @property
     def num_selected(self) -> int:
@@ -215,15 +216,18 @@ class DocSelector:
             )
 
             raw = response.choices[0].message.content or ""
+            usage = self.llm_provider.get_usage_and_cost(response)
+            
             logger.debug("DocSelector  raw LLM response: %s", raw[:500])
 
             result = self._parse_response(raw, original_query, all_doc_names)
+            result.usage = usage
+            
             logger.info(
-                "DocSelector.select  done  selected=%d/%d  docs=%s  reasoning=%r",
+                "DocSelector.select  done  selected=%d/%d  cost=$%.6f",
                 result.num_selected,
                 result.num_total,
-                result.selected_docs,
-                result.reasoning[:100] if result.reasoning else "",
+                usage.get("cost", 0.0),
             )
             return result
 

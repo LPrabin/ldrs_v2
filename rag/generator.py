@@ -26,13 +26,21 @@ Example:
 """
 
 import os
-from typing import TYPE_CHECKING, List
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, List, Dict, Any
 from dotenv import load_dotenv
 
 load_dotenv()
 
 if TYPE_CHECKING:
     from ldrs.llm_provider import LLMProvider
+
+
+@dataclass
+class GenerationResult:
+    """Result of answer generation."""
+    answer: str
+    usage: Dict[str, Any] = field(default_factory=dict)  # prompt_tokens, completion_tokens, total_tokens, cost
 
 
 class Generator:
@@ -138,7 +146,7 @@ class Generator:
 
         return "\n\n".join(selected_contexts)
 
-    async def generate(self, query: str, context: List[str]) -> str:
+    async def generate(self, query: str, context: List[str]) -> GenerationResult:
         """
         Generate an answer based on the retrieved context.
 
@@ -150,28 +158,32 @@ class Generator:
             context: List of context strings (one per retrieved node).
 
         Returns:
-            The generated answer string.
+            GenerationResult containing the answer and usage stats.
             Returns a fallback message if context is empty.
 
         Example:
-            >>> answer = await generator.generate(
+            >>> result = await generator.generate(
             ...     query="What was the inflation rate?",
             ...     context=[
             ...         "## Section: Inflation (Pages 12-14)\\n--- Page 12 ---\n...",
             ...         "## Section: Food Inflation (Pages 15-16)\\n--- Page 15 ---\n..."
             ...     ]
             ... )
-            >>> print(answer)
+            >>> print(result.answer)
             The annual average inflation rate in 2022-23 was 7.74%...
         """
         if not context:
-            return "No relevant context found to answer this question."
+            return GenerationResult(
+                answer="No relevant context found to answer this question."
+            )
 
         # Truncate context to respect model limits
         context_text = self._truncate_context(context, query)
 
         if not context_text:
-            return "Context was truncated and is now empty. Unable to answer."
+            return GenerationResult(
+                answer="Context was truncated and is now empty. Unable to answer."
+            )
 
         prompt = f"""Answer the question based ONLY on the provided context.
 If the context doesn't contain enough information, say so.
@@ -188,5 +200,10 @@ Answer:"""
             messages=[{"role": "user", "content": prompt}],
             temperature=0,  # Deterministic output for consistent answers
         )
+        
+        usage = self.llm_provider.get_usage_and_cost(response)
 
-        return response.choices[0].message.content.strip()
+        return GenerationResult(
+            answer=response.choices[0].message.content.strip(),
+            usage=usage
+        )

@@ -12,7 +12,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Dict, Any
 
 from dotenv import load_dotenv
 
@@ -64,6 +64,7 @@ class ExpandedQuery:
     original_query: str
     sub_queries: List[str]
     reasoning: str = ""
+    usage: Dict[str, Any] = field(default_factory=dict)  # prompt_tokens, completion_tokens, total_tokens, cost
 
 
 # ---------------------------------------------------------------------------
@@ -138,13 +139,18 @@ class QueryExpander:
             )
 
             raw = response.choices[0].message.content or ""
+            usage = self.llm_provider.get_usage_and_cost(response)
+            
             logger.debug("QueryExpander  raw LLM response: %s", raw[:500])
 
             result = self._parse_response(raw, query)
+            result.usage = usage
+            
             logger.info(
-                "QueryExpander.expand  done  sub_queries=%d  reasoning=%r",
+                "QueryExpander.expand  done  sub_queries=%d  reasoning=%r  cost=$%.6f",
                 len(result.sub_queries),
                 result.reasoning[:100] if result.reasoning else "",
+                usage.get("cost", 0.0),
             )
             return result
 

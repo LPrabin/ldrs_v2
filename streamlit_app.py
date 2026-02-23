@@ -558,6 +558,13 @@ def render_indexing_tab():
         help="If blank, the doc_name from the index is used.",
     )
 
+    use_ocr = st.checkbox(
+        "Use OCR for text extraction (Recommended for Nepali text)",
+        value=False,
+        help="Extract text using OCR rather than standard font-based extraction.",
+        key="index_use_ocr",
+    )
+
     if st.button("Index Document", type="primary"):
         if not pdf_path.strip() or not index_path.strip():
             st.error("Both PDF path and structure JSON path are required.")
@@ -574,19 +581,27 @@ def render_indexing_tab():
         md_fn = md_filename.strip() or None
         pipeline = st.session_state.pipeline
 
-        with st.spinner(
-            "Indexing document (extracting markdown, registering, logging)..."
-        ):
-            try:
-                md_path = pipeline.index_document(
-                    pdf_path=pdf_path.strip(),
-                    index_path=index_path.strip(),
-                    md_filename=md_fn,
-                )
-                st.success(f"Document indexed successfully. Markdown: `{md_path}`")
-            except Exception as e:
-                st.error(f"Indexing failed: {e}")
-                logger.exception("Document indexing failed")
+        progress_text = "Indexing document... Initializing..."
+        progress_bar = st.progress(0, text=progress_text)
+
+        def update_progress_index(current: int, total: int, message: str):
+            pct = 0.0 if total == 0 else min(max(current / total, 0.0), 1.0)
+            progress_bar.progress(pct, text=f"Indexing: {message}")
+
+        try:
+            md_path = pipeline.index_document(
+                pdf_path=pdf_path.strip(),
+                index_path=index_path.strip(),
+                md_filename=md_fn,
+                use_ocr=use_ocr,
+                progress_callback=update_progress_index,
+            )
+            progress_bar.progress(1.0, text="Indexing Complete!")
+            st.success(f"Document indexed successfully. Markdown: `{md_path}`")
+        except Exception as e:
+            progress_bar.empty()
+            st.error(f"Indexing failed: {e}")
+            logger.exception("Document indexing failed")
 
     # Quick-index from test data
     st.divider()
@@ -614,15 +629,23 @@ def render_indexing_tab():
                 if not os.path.exists(pdf):
                     st.error(f"PDF not found: {pdf}")
                 else:
-                    with st.spinner(f"Indexing {stem}..."):
-                        try:
-                            md_path = st.session_state.pipeline.index_document(
-                                pdf_path=pdf,
-                                index_path=idx,
-                            )
-                            st.success(f"Indexed: `{md_path}`")
-                        except Exception as e:
-                            st.error(f"Failed: {e}")
+                    progress_bar = st.progress(0, text=f"Indexing {stem}...")
+
+                    def update_progress_quick(current: int, total: int, message: str):
+                        pct = 0.0 if total == 0 else min(max(current / total, 0.0), 1.0)
+                        progress_bar.progress(pct, text=f"{stem}: {message}")
+
+                    try:
+                        md_path = st.session_state.pipeline.index_document(
+                            pdf_path=pdf,
+                            index_path=idx,
+                            progress_callback=update_progress_quick,
+                        )
+                        progress_bar.progress(1.0, text="Complete!")
+                        st.success(f"Indexed: `{md_path}`")
+                    except Exception as e:
+                        progress_bar.empty()
+                        st.error(f"Failed: {e}")
         else:
             st.info(f"No *_structure.json files found in {results_dir}")
     else:
@@ -666,6 +689,13 @@ def render_pageindex_tab():
         key="pageindex_md_filename",
     )
 
+    use_ocr = st.checkbox(
+        "Use OCR for text extraction (Recommended for Nepali text)",
+        value=False,
+        help="Extract text using OCR rather than standard font-based extraction. Essential for documents containing Devanagari script.",
+        key="pageindex_use_ocr",
+    )
+
     if st.button("Run PageIndex", type="primary", key="run_pageindex"):
         if not pdf_path.strip():
             st.error("PDF file path is required.")
@@ -679,27 +709,36 @@ def render_pageindex_tab():
         md_fn = md_filename.strip() or None
         pipeline = st.session_state.pipeline
 
-        with st.spinner(
-            "Running PageIndex (this may take a while for large PDFs — "
-            "involves LLM calls for structure analysis)..."
-        ):
-            try:
-                md_path = run_async(
-                    pipeline.index_document_from_pdf(
-                        pdf_path=pdf_path.strip(),
-                        output_dir=out_dir,
-                        md_filename=md_fn,
-                    )
+        # Set up a progress bar
+        progress_text = "Running PageIndex... Initializing..."
+        progress_bar = st.progress(0, text=progress_text)
+
+        def update_progress(current: int, total: int, message: str):
+            # Calculate percentage (0.0 to 1.0)
+            pct = 0.0 if total == 0 else min(max(current / total, 0.0), 1.0)
+            progress_bar.progress(pct, text=f"PageIndex: {message}")
+
+        try:
+            md_path = run_async(
+                pipeline.index_document_from_pdf(
+                    pdf_path=pdf_path.strip(),
+                    output_dir=out_dir,
+                    md_filename=md_fn,
+                    use_ocr=use_ocr,
+                    progress_callback=update_progress,
                 )
-                st.success(
-                    f"Document indexed successfully!\n\n"
-                    f"Markdown file: `{md_path}`\n\n"
-                    f"Corpus now has "
-                    f"**{len(pipeline.registry.doc_names)}** documents."
-                )
-            except Exception as e:
-                st.error(f"PageIndex failed: {e}")
-                logger.exception("PageIndex indexing failed")
+            )
+            progress_bar.progress(1.0, text="PageIndex Complete!")
+            st.success(
+                f"Document indexed successfully!\n\n"
+                f"Markdown file: `{md_path}`\n\n"
+                f"Corpus now has "
+                f"**{len(pipeline.registry.doc_names)}** documents."
+            )
+        except Exception as e:
+            progress_bar.empty()
+            st.error(f"PageIndex failed: {e}")
+            logger.exception("PageIndex indexing failed")
 
     # Quick-index from Nepalidocs
     st.divider()
@@ -713,6 +752,7 @@ def render_pageindex_tab():
         )
         if pdf_files:
             selected = st.selectbox("Nepali PDF", pdf_files, key="nepali_pdf_select")
+            use_ocr_nepali = st.checkbox("Use OCR", value=True, key="use_ocr_nepali")
             if selected and st.button(
                 "Run PageIndex on Selected",
                 use_container_width=True,
@@ -722,18 +762,29 @@ def render_pageindex_tab():
                 out_dir = os.path.join(nepali_dir, "index")
                 os.makedirs(out_dir, exist_ok=True)
 
-                with st.spinner(f"Running PageIndex on {selected}..."):
-                    try:
-                        md_path = run_async(
-                            st.session_state.pipeline.index_document_from_pdf(
-                                pdf_path=full_path,
-                                output_dir=out_dir,
-                            )
+                progress_bar = st.progress(
+                    0, text=f"Running PageIndex on {selected}..."
+                )
+
+                def update_progress_nepali(current: int, total: int, message: str):
+                    pct = 0.0 if total == 0 else min(max(current / total, 0.0), 1.0)
+                    progress_bar.progress(pct, text=f"{selected}: {message}")
+
+                try:
+                    md_path = run_async(
+                        st.session_state.pipeline.index_document_from_pdf(
+                            pdf_path=full_path,
+                            output_dir=out_dir,
+                            use_ocr=use_ocr_nepali,
+                            progress_callback=update_progress_nepali,
                         )
-                        st.success(f"Indexed: `{md_path}`")
-                    except Exception as e:
-                        st.error(f"Failed: {e}")
-                        logger.exception("Nepali PageIndex failed")
+                    )
+                    progress_bar.progress(1.0, text="Complete!")
+                    st.success(f"Indexed: `{md_path}`")
+                except Exception as e:
+                    progress_bar.empty()
+                    st.error(f"Failed: {e}")
+                    logger.exception("Nepali PageIndex failed")
         else:
             st.info("No PDF files found in Nepalidocs/")
     else:

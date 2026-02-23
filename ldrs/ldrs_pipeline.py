@@ -49,7 +49,7 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -174,6 +174,7 @@ class LDRSResult:
         selection_reasoning: Why DocSelector chose these documents.
         timings:            Dict of stage-name → elapsed seconds.
         error:              Error message if the pipeline failed.
+        usage_stats:        Aggregated LLM usage (tokens, cost).
     """
 
     query: str = ""
@@ -187,6 +188,7 @@ class LDRSResult:
     selection_reasoning: str = ""
     timings: Dict[str, float] = field(default_factory=dict)
     error: str = ""
+    usage_stats: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -405,20 +407,21 @@ class LDRSPipeline:
         pdf_path: str,
         index_path: str,
         md_filename: Optional[str] = None,
+        use_ocr: bool = False,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> str:
         """
-        Index a single document: extract .md, register, and log.
+        Manually ingest an existing PDF + structure JSON into the corpus.
 
         Uses :class:`PdfExtractor` (font-based heading detection) to
-        extract markdown from the PDF.  The ``index_path`` (structure JSON)
-        is used for the DocRegistry and ChangeLog only — it is NOT needed
-        for the markdown extraction step.
+        generate the full `.md` text, registers the pair in DocRegistry,
+        and logs to ChangeLog.
 
         Args:
-            pdf_path:    Path to the source PDF file.
-            index_path:  Path to the ``*_structure.json`` file.
-            md_filename: Custom ``.md`` filename.  If ``None``, uses the
-                         document name from the index.
+            pdf_path:    Path to the raw PDF file.
+            index_path:  Path to the existing ``*_structure.json``.
+            md_filename: Custom ``.md`` filename.
+            use_ocr:     If True, use OCR to extract text.
 
         Returns:
             Path to the generated ``.md`` file.
@@ -431,8 +434,11 @@ class LDRSPipeline:
         extractor = PdfExtractor(
             pdf_path=pdf_path,
             output_dir=self.config.md_dir,
+            use_ocr=use_ocr,
         )
-        md_path = extractor.extract(output_filename=md_filename)
+        md_path = extractor.extract(
+            output_filename=md_filename, progress_callback=progress_callback
+        )
         logger.info("LDRSPipeline.index_document  md extracted: %s", md_path)
 
         # Register
@@ -463,8 +469,10 @@ class LDRSPipeline:
         pdf_path: str,
         output_dir: Optional[str] = None,
         md_filename: Optional[str] = None,
-        if_add_node_summary: str = "no",
-        if_add_doc_description: str = "no",
+        if_add_node_summary: str = "yes",
+        if_add_doc_description: str = "yes",
+        use_ocr: bool = False,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> str:
         """
         Generate a structure index from a raw PDF and ingest it into the corpus.
@@ -492,6 +500,7 @@ class LDRSPipeline:
             md_filename:           Custom ``.md`` filename.
             if_add_node_summary:   "yes" to generate LLM summaries for nodes.
             if_add_doc_description: "yes" to generate an LLM doc description.
+            use_ocr:               If True, use OCR to extract text (recommended for Nepali).
 
         Returns:
             Path to the generated ``.md`` file.
@@ -518,8 +527,11 @@ class LDRSPipeline:
         extractor = PdfExtractor(
             pdf_path=pdf_path,
             output_dir=md_output_dir,
+            use_ocr=use_ocr,
         )
-        md_path = extractor.extract(output_filename=md_filename)
+        md_path = extractor.extract(
+            output_filename=md_filename, progress_callback=progress_callback
+        )
         elapsed_extract = time.monotonic() - t0
 
         doc_name = _ud.normalize("NFC", os.path.basename(pdf_path))
@@ -646,6 +658,20 @@ class LDRSPipeline:
         result = LDRSResult(query=user_query)
         timings: Dict[str, float] = {}
 
+        # Aggregate usage tracking
+        total_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost": 0.0,
+        }
+
+        def _add_usage(u: Dict[str, Any]):
+            total_usage["prompt_tokens"] += u.get("prompt_tokens", 0)
+            total_usage["completion_tokens"] += u.get("completion_tokens", 0)
+            total_usage["total_tokens"] += u.get("total_tokens", 0)
+            total_usage["cost"] += u.get("cost", 0.0)
+
         # NFC-normalize the query
         user_query = unicodedata.normalize("NFC", user_query)
 
@@ -656,6 +682,9 @@ class LDRSPipeline:
             t0 = time.monotonic()
             expanded: ExpandedQuery = await self.query_expander.expand(user_query)
             timings["query_expansion"] = time.monotonic() - t0
+
+            if expanded.usage:
+                _add_usage(expanded.usage)
 
             result.sub_queries = expanded.sub_queries
             result.expansion_reasoning = expanded.reasoning
@@ -682,6 +711,9 @@ class LDRSPipeline:
             )
             timings["doc_selection"] = time.monotonic() - t0
 
+            if selection.usage:
+                _add_usage(selection.usage)
+
             result.selected_docs = selection.selected_docs
             result.selection_reasoning = selection.reasoning
             logger.info(
@@ -697,6 +729,7 @@ class LDRSPipeline:
                     "The corpus may not contain information about this topic."
                 )
                 result.timings = timings
+                result.usage_stats = total_usage
                 return result
 
             # ============================================================
@@ -769,6 +802,7 @@ class LDRSPipeline:
                     "sections were found matching the query."
                 )
                 result.timings = timings
+                result.usage_stats = total_usage
                 return result
 
             # ============================================================
@@ -777,17 +811,22 @@ class LDRSPipeline:
             t0 = time.monotonic()
             # Feed the formatted merged context to the generator as a
             # single-element list (generator expects List[str])
-            answer = await self.generator.generate(
+
+            gen_result = await self.generator.generate(
                 query=user_query,
                 context=[merged.formatted_context],
             )
             timings["generation"] = time.monotonic() - t0
 
-            result.answer = answer
+            if gen_result.usage:
+                _add_usage(gen_result.usage)
+
+            result.answer = gen_result.answer
             logger.info(
-                "Stage 5 done  answer_len=%d  elapsed=%.2fs",
-                len(answer),
+                "Stage 5 done  answer_len=%d  elapsed=%.2fs  cost=$%.6f",
+                len(gen_result.answer),
                 timings["generation"],
+                gen_result.usage.get("cost", 0.0),
             )
 
             # ============================================================
@@ -801,10 +840,13 @@ class LDRSPipeline:
             result.answer = f"An error occurred while processing the query: {e}"
 
         result.timings = timings
+        result.usage_stats = total_usage
+
         total_elapsed = sum(timings.values())
         logger.info(
-            "LDRSPipeline.query  complete  total=%.2fs  stages=%s",
+            "LDRSPipeline.query  complete  total=%.2fs  cost=$%.6f  stages=%s",
             total_elapsed,
+            total_usage["cost"],
             {k: f"{v:.2f}s" for k, v in timings.items()},
         )
         return result
