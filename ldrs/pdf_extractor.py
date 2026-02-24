@@ -38,10 +38,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 import numpy as np
-from paddleocr import PaddleOCR
+import pytesseract
 from pdf2image import convert_from_path
 
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -400,16 +401,18 @@ class PdfExtractor:
         self, progress_callback: Optional[Callable[[int, int, str], None]] = None
     ) -> Tuple[str, str]:
         """
-        Extract text and tables from the PDF using OCR as a fallback.
+        Extract text and tables from the PDF using Tesseract OCR as a fallback.
 
         Returns:
             A tuple containing the main markdown content and the table markdown content.
+            Note: Tesseract does not separate tables cleanly like PPStructure,
+            so table_text will be empty or minimal, with content integrated into full_text.
         """
-        logger.info("Falling back to OCR for PDF: %s", self.pdf_path)
+        logger.info("Falling back to Tesseract OCR for PDF: %s", self.pdf_path)
         if progress_callback:
             progress_callback(0, 1, "Initializing OCR engine...")
         try:
-            # Check for pdftoppm
+            # Check for pdftoppm (poppler)
             subprocess.run(["pdftoppm", "-h"], capture_output=True, check=False)
         except FileNotFoundError:
             logger.error(
@@ -417,26 +420,11 @@ class PdfExtractor:
             )
             return "", ""
 
+        # Convert PDF to images
         images = convert_from_path(self.pdf_path)
 
-        # Initialize PaddleOCR for text extraction
-        # Note: lang='ne' is for Nepali
-        ocr = PaddleOCR(use_angle_cls=True, lang="ne", show_log=False)
-
-        # Initialize PaddleOCR for table/structure extraction
-        # We use PP-Structure for table recognition
-        from paddleocr import PPStructure
-
-        try:
-            table_engine = PPStructure(
-                show_log=False, lang="en", layout=False, table=True
-            )
-        except Exception as e:
-            logger.error("Failed to initialize PPStructure: %s", e)
-            table_engine = None
-
         full_text = []
-        table_text = []
+        table_text = []  # Tesseract handles tables implicitly in text stream
         total_pages = len(images)
 
         for i, image in enumerate(images):
@@ -444,39 +432,26 @@ class PdfExtractor:
                 progress_callback(
                     i + 1,
                     total_pages,
-                    f"Extracting text from page {i + 1} of {total_pages} using OCR...",
+                    f"Extracting text from page {i + 1} of {total_pages} using Tesseract...",
                 )
 
-            image_np = np.array(image)
+            # Tesseract OCR
+            # Using 'nep+eng' to support mixed language content
+            try:
+                # psm 3 is "Fully automatic page segmentation, but no OSD. (Default)"
+                # which generally works best for full page scans including tables
+                text = pytesseract.image_to_string(
+                    image, lang="nep+eng", config="--psm 3"
+                )
 
-            # Extract text
-            result = ocr.ocr(image_np, cls=True)
-            full_text.append(f"<!-- page: {i + 1} -->")
-            if result and result[0] is not None:
-                # result[0] is a list of [box, (text, confidence)]
-                texts = [line[1][0] for line in result[0]]
-                full_text.extend(texts)
-            full_text.append("")
-
-            # Extract tables using PPStructure if available
-            if table_engine:
-                if progress_callback:
-                    progress_callback(
-                        i + 1,
-                        total_pages,
-                        f"Extracting tables from page {i + 1} of {total_pages} using OCR...",
-                    )
-                try:
-                    table_result = table_engine(image_np)
-                    if table_result:
-                        for res in table_result:
-                            if res["type"] == "table":
-                                table_text.append(f"<!-- page: {i + 1} -->")
-                                if "html" in res["res"]:
-                                    table_text.append(res["res"]["html"])
-                                table_text.append("")
-                except Exception as e:
-                    logger.warning("Table extraction failed for page %d: %s", i + 1, e)
+                full_text.append(f"<!-- page: {i + 1} -->")
+                full_text.append(text)
+                full_text.append("")
+            except Exception as e:
+                logger.error("Tesseract OCR failed for page %d: %s", i + 1, e)
+                full_text.append(f"<!-- page: {i + 1} -->")
+                full_text.append("[OCR Failed for this page]")
+                full_text.append("")
 
         if progress_callback:
             progress_callback(total_pages, total_pages, "OCR Extraction complete.")

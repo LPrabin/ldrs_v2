@@ -47,7 +47,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -154,6 +154,20 @@ class IndexPdfRequest(BaseModel):
     use_ocr: bool = Field(
         False,
         description="Extract text using OCR rather than font-based extraction. Essential for documents containing Devanagari script.",
+    )
+
+
+class BatchIndexPdfRequest(BaseModel):
+    """Request body for /batch-index-pdf."""
+
+    pdf_paths: List[str] = Field(..., description="List of paths to PDF files.")
+    output_dir: Optional[str] = Field(
+        None,
+        description="Directory to save structure JSON and .md files.",
+    )
+    use_ocr: bool = Field(
+        False,
+        description="Extract text using OCR rather than font-based extraction.",
     )
 
 
@@ -462,6 +476,59 @@ async def index_pdf_endpoint(request: IndexPdfRequest):
     except Exception as e:
         logger.exception("POST /index-pdf  error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _run_batch_index_background(
+    pdf_paths: List[str], output_dir: str, use_ocr: bool
+):
+    """Background task to run indexing without blocking the API."""
+    logger.info("Starting background batch indexing for %d files...", len(pdf_paths))
+    for pdf_path in pdf_paths:
+        if not os.path.exists(pdf_path):
+            logger.error("Background index failed: PDF not found %s", pdf_path)
+            continue
+
+        try:
+            logger.info("Background indexing: %s", pdf_path)
+            await pipeline.index_document_from_pdf(
+                pdf_path=pdf_path,
+                output_dir=output_dir,
+                md_filename=None,
+                use_ocr=use_ocr,
+            )
+            logger.info("Background indexing completed for: %s", pdf_path)
+        except Exception as e:
+            logger.exception("Background indexing error for %s: %s", pdf_path, e)
+
+    logger.info("Background batch indexing completed.")
+
+
+@app.post("/batch-index-pdf")
+async def batch_index_pdf_endpoint(
+    request: BatchIndexPdfRequest, background_tasks: BackgroundTasks
+):
+    """
+    Index multiple raw PDFs sequentially in the background.
+    """
+    if not pipeline:
+        raise HTTPException(status_code=503, detail="Pipeline not initialised")
+
+    output_dir = request.output_dir or pipeline.config.results_dir
+    logger.info(
+        "POST /batch-index-pdf  pdfs=%d  output_dir=%s",
+        len(request.pdf_paths),
+        output_dir,
+    )
+
+    background_tasks.add_task(
+        _run_batch_index_background, request.pdf_paths, output_dir, request.use_ocr
+    )
+
+    return {
+        "status": "accepted",
+        "message": f"Started background indexing for {len(request.pdf_paths)} documents.",
+        "corpus_docs": len(pipeline.registry.doc_names),
+    }
 
 
 @app.get("/providers")

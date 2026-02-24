@@ -1920,9 +1920,11 @@ class TestLDRSPipelineQuery:
         pipeline._retrieve_from_document = _fake_retrieve
 
         # Mock Generator
+        from rag.generator import GenerationResult
+
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = (
-            "The main topic is about Earth Mover's Distance."
+        mock_generator.generate.return_value = GenerationResult(
+            answer="The main topic is about Earth Mover's Distance.", usage={}
         )
         pipeline._generator = mock_generator
 

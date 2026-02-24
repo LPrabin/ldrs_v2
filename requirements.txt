@@ -14,3 +14,4 @@ paddleocr==2.8.1
 pdf2image
 numpy
 paddlepaddle==2.6.2
+setuptools

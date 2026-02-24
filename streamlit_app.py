@@ -18,6 +18,7 @@ import logging
 import os
 import sys
 import time
+import subprocess
 
 import streamlit as st
 
@@ -670,23 +671,18 @@ def render_pageindex_tab():
     )
 
     # File path input
-    pdf_path = st.text_input(
-        "PDF file path",
-        placeholder="/path/to/document.pdf",
-        help="Absolute or relative path to the PDF file.",
-        key="pageindex_pdf_path",
+    pdf_paths_input = st.text_area(
+        "PDF file paths (one per line)",
+        placeholder="/path/to/document1.pdf\n/path/to/document2.pdf",
+        help="Absolute or relative paths to the PDF files, one per line.",
+        key="pageindex_pdf_paths",
+        height=100,
     )
     output_dir = st.text_input(
         "Output directory (optional)",
         placeholder=f"Defaults to: {st.session_state.results_dir}",
         help="Directory to save the structure JSON and .md files.",
         key="pageindex_output_dir",
-    )
-    md_filename = st.text_input(
-        "Custom .md filename (optional)",
-        placeholder="Leave blank for auto-naming",
-        help="If blank, the doc_name from the generated index is used.",
-        key="pageindex_md_filename",
     )
 
     use_ocr = st.checkbox(
@@ -697,16 +693,17 @@ def render_pageindex_tab():
     )
 
     if st.button("Run PageIndex", type="primary", key="run_pageindex"):
-        if not pdf_path.strip():
-            st.error("PDF file path is required.")
+        paths = [p.strip() for p in pdf_paths_input.splitlines() if p.strip()]
+        if not paths:
+            st.error("At least one PDF file path is required.")
             return
 
-        if not os.path.exists(pdf_path.strip()):
-            st.error(f"PDF file not found: {pdf_path}")
-            return
+        for p in paths:
+            if not os.path.exists(p):
+                st.error(f"PDF file not found: {p}")
+                return
 
         out_dir = output_dir.strip() or None
-        md_fn = md_filename.strip() or None
         pipeline = st.session_state.pipeline
 
         # Set up a progress bar
@@ -718,32 +715,44 @@ def render_pageindex_tab():
             pct = 0.0 if total == 0 else min(max(current / total, 0.0), 1.0)
             progress_bar.progress(pct, text=f"PageIndex: {message}")
 
-        try:
-            md_path = run_async(
-                pipeline.index_document_from_pdf(
-                    pdf_path=pdf_path.strip(),
-                    output_dir=out_dir,
-                    md_filename=md_fn,
-                    use_ocr=use_ocr,
-                    progress_callback=update_progress,
+        successes = []
+        errors = []
+
+        for idx, pdf_path in enumerate(paths):
+            st.write(f"**Processing ({idx + 1}/{len(paths)}):** `{pdf_path}`")
+            try:
+                # With Tesseract, we can run safely in-process without segfaults
+                md_path = run_async(
+                    pipeline.index_document_from_pdf(
+                        pdf_path=pdf_path,
+                        output_dir=out_dir,
+                        md_filename=None,
+                        use_ocr=use_ocr,
+                        progress_callback=update_progress,
+                    )
                 )
-            )
-            progress_bar.progress(1.0, text="PageIndex Complete!")
+                successes.append(md_path)
+            except Exception as e:
+                errors.append((pdf_path, str(e)))
+                logger.exception("PageIndex indexing failed for %s", pdf_path)
+
+        progress_bar.progress(1.0, text="PageIndex Complete!")
+
+        if successes:
             st.success(
-                f"Document indexed successfully!\n\n"
-                f"Markdown file: `{md_path}`\n\n"
-                f"Corpus now has "
-                f"**{len(pipeline.registry.doc_names)}** documents."
+                f"Successfully indexed **{len(successes)}** document(s)!\n\n"
+                f"Corpus now has **{len(pipeline.registry.doc_names)}** documents."
             )
-        except Exception as e:
-            progress_bar.empty()
-            st.error(f"PageIndex failed: {e}")
-            logger.exception("PageIndex indexing failed")
+        if errors:
+            for pdf_path, err in errors:
+                st.error(f"Failed to index `{pdf_path}`: {err}")
 
     # Quick-index from Nepalidocs
     st.divider()
     st.subheader("Quick Index — Nepali Documents")
-    st.markdown("Select a PDF from the `Nepalidocs/` folder to run PageIndex on it.")
+    st.markdown(
+        "Select PDFs from the `Nepalidocs/` folder to run PageIndex on them sequentially."
+    )
 
     nepali_dir = os.path.join(PROJECT_ROOT, "Nepalidocs")
     if os.path.isdir(nepali_dir):
@@ -751,40 +760,58 @@ def render_pageindex_tab():
             [f for f in os.listdir(nepali_dir) if f.lower().endswith(".pdf")]
         )
         if pdf_files:
-            selected = st.selectbox("Nepali PDF", pdf_files, key="nepali_pdf_select")
+            selected_files = st.multiselect(
+                "Nepali PDFs", pdf_files, key="nepali_pdf_select"
+            )
             use_ocr_nepali = st.checkbox("Use OCR", value=True, key="use_ocr_nepali")
-            if selected and st.button(
+            if selected_files and st.button(
                 "Run PageIndex on Selected",
                 use_container_width=True,
                 key="run_pageindex_nepali",
             ):
-                full_path = os.path.join(nepali_dir, selected)
                 out_dir = os.path.join(nepali_dir, "index")
                 os.makedirs(out_dir, exist_ok=True)
 
-                progress_bar = st.progress(
-                    0, text=f"Running PageIndex on {selected}..."
-                )
+                progress_bar = st.progress(0, text="Starting PageIndex...")
 
                 def update_progress_nepali(current: int, total: int, message: str):
                     pct = 0.0 if total == 0 else min(max(current / total, 0.0), 1.0)
-                    progress_bar.progress(pct, text=f"{selected}: {message}")
+                    progress_bar.progress(pct, text=f"{current_doc}: {message}")
 
-                try:
-                    md_path = run_async(
-                        st.session_state.pipeline.index_document_from_pdf(
-                            pdf_path=full_path,
-                            output_dir=out_dir,
-                            use_ocr=use_ocr_nepali,
-                            progress_callback=update_progress_nepali,
-                        )
+                successes = []
+                errors = []
+
+                for idx, selected in enumerate(selected_files):
+                    current_doc = selected
+                    full_path = os.path.join(nepali_dir, selected)
+                    st.write(
+                        f"**Processing ({idx + 1}/{len(selected_files)}):** `{selected}`"
                     )
-                    progress_bar.progress(1.0, text="Complete!")
-                    st.success(f"Indexed: `{md_path}`")
-                except Exception as e:
-                    progress_bar.empty()
-                    st.error(f"Failed: {e}")
-                    logger.exception("Nepali PageIndex failed")
+
+                    try:
+                        # With Tesseract, we can run safely in-process without segfaults
+                        md_path = run_async(
+                            st.session_state.pipeline.index_document_from_pdf(
+                                pdf_path=full_path,
+                                output_dir=out_dir,
+                                use_ocr=use_ocr_nepali,
+                                progress_callback=update_progress_nepali,
+                            )
+                        )
+                        successes.append(md_path)
+                    except Exception as e:
+                        errors.append((selected, str(e)))
+                        logger.exception("Nepali PageIndex failed for %s", selected)
+
+                progress_bar.progress(1.0, text="Complete!")
+
+                if successes:
+                    st.success(
+                        f"Successfully indexed **{len(successes)}** document(s)."
+                    )
+                if errors:
+                    for doc, err in errors:
+                        st.error(f"Failed to index `{doc}`: {err}")
         else:
             st.info("No PDF files found in Nepalidocs/")
     else:
